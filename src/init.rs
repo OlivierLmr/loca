@@ -20,6 +20,7 @@ const DEFAULT_PROXY_TOML: &str = r#"# loca proxy configuration. All keys are opt
 # spawn_timeout_sec = 240         # max seconds to wait for a backend to come up
 # max_tokens = 16384              # max tokens for `mlx_lm.server --max-tokens`
 # ram_budget_gb = 24              # advisory; the TUI shows red when exceeded
+# prompt_cache_gb = 4             # cap on KV caches kept between requests; 0 = no cap
 "#;
 
 /// Returns true if anything was created.

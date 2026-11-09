@@ -8,4 +8,6 @@ pub mod log_bus;
 pub mod manager;
 pub mod paths;
 pub mod proxy;
+pub mod stats;
+pub mod sysmem;
 pub mod tui;

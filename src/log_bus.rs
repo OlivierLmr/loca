@@ -34,7 +34,7 @@ impl LogBus {
 
     pub fn emit(&self, source: &str, msg: &str) {
         let ts = chrono_lite::hms_now();
-        let line = format!("{ts}  {msg}");
+        let line = format!("{ts}  {}", sanitize(msg));
         {
             let mut hist = self.history.lock();
             let buf = hist
@@ -70,9 +70,24 @@ impl LogBus {
     }
 }
 
+/// Progress bars (e.g. the HF "Fetching N files" bar on mlx's stderr) redraw
+/// with `\r`; drawn raw, they smear over the rest of the TUI. Keep the last
+/// frame and drop other control characters.
+fn sanitize(msg: &str) -> String {
+    let last = msg.trim_end_matches('\r').rsplit('\r').next().unwrap_or(msg);
+    last.chars().filter(|c| !c.is_control() || *c == '\t').collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sanitize_keeps_last_progress_frame() {
+        assert_eq!(sanitize("Fetching 9 files:  10%|\rFetching 9 files: 100%|\r"), "Fetching 9 files: 100%|");
+        assert_eq!(sanitize("a\x1b[Kb"), "a[Kb");
+        assert_eq!(sanitize("plain"), "plain");
+    }
 
     #[test]
     fn emit_writes_to_history() {

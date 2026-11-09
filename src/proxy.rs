@@ -9,12 +9,13 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::manager::BackendManager;
+use crate::stats::SseTap;
 
 #[derive(Clone)]
 pub struct ProxyState {
@@ -78,7 +79,9 @@ struct ModelBody {
 
 async fn admin_status(State(s): State<ProxyState>) -> Json<Value> {
     let mut loaded = Vec::new();
+    let now = std::time::Instant::now();
     for inst in s.mgr.instances().await {
+        let (active, in_flight, last) = inst.request_stats();
         let state = match inst.state().await {
             crate::backend::BackendState::Stopped => "stopped",
             crate::backend::BackendState::Loading => "loading",
@@ -95,6 +98,9 @@ async fn admin_status(State(s): State<ProxyState>) -> Json<Value> {
             "request_count": inst.request_count.load(std::sync::atomic::Ordering::Relaxed),
             "error_count": inst.error_count.load(std::sync::atomic::Ordering::Relaxed),
             "ram_gb": s.mgr.models.get(&inst.alias).and_then(|m| m.ram_gb),
+            "in_flight": in_flight,
+            "current_request": active.map(|r| r.to_json(now)),
+            "last_request": last.map(|r| r.to_json(now)),
         }));
     }
     Json(json!({
@@ -214,10 +220,24 @@ async fn forward(
         }
     };
     inst.note_request();
+    let guard = inst.enter_request(s.mgr.bus.clone());
 
     // Rewrite the model field to the HF id for the upstream call.
     if let Some(m) = payload.get_mut("model") {
         *m = Value::String(hf.clone());
+    }
+    // Ask for the final usage chunk (exact token counts, cached prompt
+    // tokens) on every stream; SseTap drops it if the client didn't ask.
+    let client_wants_usage = payload["stream_options"]["include_usage"]
+        .as_bool()
+        .unwrap_or(false);
+    if is_stream && !client_wants_usage {
+        if let Some(obj) = payload.as_object_mut() {
+            let opts = obj.entry("stream_options").or_insert_with(|| json!({}));
+            if let Some(opts) = opts.as_object_mut() {
+                opts.insert("include_usage".into(), Value::Bool(true));
+            }
+        }
     }
 
     let upstream_url = format!(
@@ -250,14 +270,46 @@ async fn forward(
         .cloned()
         .unwrap_or_else(|| HeaderValue::from_static("application/json"));
 
-    // Stream the body through. reqwest's bytes_stream gives Result<Bytes, reqwest::Error>;
-    // axum's Body::from_stream wants Result<Bytes, BoxError>.
+    // Stream the body through, counting bytes and emitting periodic
+    // heartbeats so the log pane doesn't look frozen during long token
+    // generation. `_guard` is held inside the closure and drops when the
+    // stream ends (or the client disconnects), decrementing in_flight.
     use futures::stream::StreamExt;
     let alias_for_stream = alias.clone();
     let bus = s.mgr.bus.clone();
+    let inst_for_stream = inst.clone();
+    let mut last_heartbeat = std::time::Instant::now();
+    let heartbeat_every = std::time::Duration::from_secs(5);
+    let tap = std::sync::Arc::new(parking_lot::Mutex::new(SseTap::new(!client_wants_usage)));
+    let tap_for_end = tap.clone();
+    let tap_events = is_stream && status.is_success();
     let stream = upstream_resp.bytes_stream().map(move |chunk| {
+        // Borrow keeps the guard alive for the closure's lifetime.
+        let g = &guard;
         match chunk {
-            Ok(b) => Ok::<_, std::io::Error>(b),
+            Ok(b) => {
+                inst_for_stream.add_bytes(b.len() as u64);
+                let b = if tap_events {
+                    let now = std::time::Instant::now();
+                    inst_for_stream
+                        .with_request_stats(g.id, |s| tap.lock().feed(&b, s, now))
+                        .unwrap_or(b)
+                } else {
+                    b
+                };
+                if last_heartbeat.elapsed() >= heartbeat_every {
+                    last_heartbeat = std::time::Instant::now();
+                    let elapsed = inst_for_stream
+                        .current_request_elapsed_sec()
+                        .unwrap_or(0);
+                    let bytes = inst_for_stream.current_request_bytes_count();
+                    bus.emit(
+                        &alias_for_stream,
+                        &format!("…streaming ({} elapsed, {})", fmt_elapsed(elapsed), fmt_bytes(bytes)),
+                    );
+                }
+                Ok::<_, std::io::Error>(b)
+            }
             Err(e) => {
                 bus.emit(
                     &alias_for_stream,
@@ -268,7 +320,11 @@ async fn forward(
         }
     });
 
-    let body = Body::from_stream(stream);
+    // Forward any trailing partial event once upstream closes.
+    let tail = futures::stream::once(async move {
+        Ok::<_, std::io::Error>(tap_for_end.lock().finish())
+    });
+    let body = Body::from_stream(stream.chain(tail));
     let mut response = Response::new(body);
     *response.status_mut() = status;
     response
@@ -292,10 +348,20 @@ pub async fn bind_listener(cfg: &crate::config::ProxyCfg) -> Result<tokio::net::
     })
 }
 
-#[derive(Serialize)]
-#[allow(dead_code)]
-struct StatusResponse {
-    loaded: Vec<Value>,
-    ram_used_gb: u32,
-    ram_budget_gb: u32,
+fn fmt_bytes(n: u64) -> String {
+    if n < 1024 {
+        format!("{n} B")
+    } else if n < 1024 * 1024 {
+        format!("{:.1} KB", n as f64 / 1024.0)
+    } else {
+        format!("{:.1} MB", n as f64 / (1024.0 * 1024.0))
+    }
+}
+
+fn fmt_elapsed(sec: u64) -> String {
+    if sec < 60 {
+        format!("{sec}s")
+    } else {
+        format!("{}m {}s", sec / 60, sec % 60)
+    }
 }

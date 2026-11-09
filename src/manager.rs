@@ -184,6 +184,10 @@ impl BackendManager {
                 if inst.state().await != BackendState::Ready {
                     continue;
                 }
+                // Never evict a backend that's actively streaming a response.
+                if inst.is_busy() {
+                    continue;
+                }
                 let Some(age) = inst.last_request_age() else { continue };
                 if age > inst.idle_timeout() {
                     self.bus.emit(&inst.alias, &format!("idle eviction after {age}s"));

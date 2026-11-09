@@ -35,6 +35,9 @@ pub struct ProxyCfg {
     pub spawn_timeout_sec: u64,
     pub max_tokens: u32,
     pub ram_budget_gb: u32,
+    /// Cap on the KV caches each mlx_lm.server keeps between requests
+    /// (`--prompt-cache-bytes`). 0 = no cap (mlx's default).
+    pub prompt_cache_gb: f64,
 }
 
 impl Default for ProxyCfg {
@@ -49,6 +52,7 @@ impl Default for ProxyCfg {
             spawn_timeout_sec: 240,
             max_tokens: 16384,
             ram_budget_gb: 24,
+            prompt_cache_gb: 4.0,
         }
     }
 }
@@ -154,6 +158,7 @@ hf = "x/m"
         assert_eq!(cfg.idle_timeout_sec, 600);
         assert_eq!(cfg.max_tokens, 16384);
         assert_eq!(cfg.ram_budget_gb, 24);
+        assert_eq!(cfg.prompt_cache_gb, 4.0);
     }
 
     #[test]

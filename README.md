@@ -33,6 +33,10 @@ idle eviction, and routing.
   models concurrently.
 - **Idle eviction per model.** Configurable per-instance from the TUI
   (`t` +10m, `T` +1h, `r` reset 10m).
+- **Speed stats per request.** The TUI shows each request's phase (waiting,
+  prompt, thinking, answering), prompt and generation tok/s, time to first
+  token, thinking vs answer tokens and cached prompt tokens, next to system
+  swap use. Also in `loca status`.
 - **No daemon.** loca runs in the foreground. When you `q` or Ctrl-C, all
   spawned backends are killed and RAM is freed. No launchd, no systemd, no
   surprises after reboot.
@@ -164,7 +168,12 @@ run so you can see the defaults:
 # spawn_timeout_sec = 240      # max seconds to wait for a backend to come up
 # max_tokens = 16384           # ceiling for `mlx_lm.server --max-tokens`
 # ram_budget_gb = 24           # advisory; the TUI shows red over the budget
+# prompt_cache_gb = 4          # cap on KV caches kept between requests; 0 = no cap
 ```
+
+`prompt_cache_gb` becomes `mlx_lm.server --prompt-cache-bytes`. Without a
+cap, mlx keeps up to 10 conversations' KV caches with no size limit, which
+can push a 32 GB Mac into swap.
 
 ### Environment variable
 
@@ -253,13 +262,15 @@ one of the aliases from your `models.toml` as the model name.
 | GET    | `/v1/models` | — | List of aliases with `loaded: bool` per entry |
 | POST   | `/v1/chat/completions` | OpenAI request body | Streams (SSE) or JSON, routed by `model` |
 | POST   | `/v1/completions` | OpenAI request body | Same |
-| GET    | `/admin/status` | — | JSON: loaded instances, RAM use, budget |
+| GET    | `/admin/status` | — | JSON: loaded instances, RAM use, budget, current/last request stats |
 | POST   | `/admin/stop` | optional `{model: alias}` (or `?model=alias`) | Stops one or all |
 | POST   | `/admin/preload` | `{model: alias}` (or `?model=alias`) | Warms a model without sending a real request |
 | GET    | `/health` | — | `{ok: true}` |
 
 The proxy strips and rewrites the `model` field of forwarded requests so the
-backend sees the HF id it was spawned with.
+backend sees the HF id it was spawned with. On streaming requests it also
+sets `stream_options.include_usage` (for exact token counts) and drops the
+resulting usage chunk again if the client didn't ask for it.
 
 ## CLI
 
@@ -280,8 +291,9 @@ backend sees the HF id it was spawned with.
   An idle watcher task evicts instances that exceed their per-instance idle
   timeout.
 - **Proxy** is an `axum` router. Forwarded streaming responses are passed
-  through with `reqwest::Response::bytes_stream()` → `axum::body::Body::from_stream(_)`,
-  so there's no buffering of SSE chunks.
+  through with `reqwest::Response::bytes_stream()` → `axum::body::Body::from_stream(_)`.
+  On the way, `stats::SseTap` splits them into SSE events to update the
+  request's speed stats; only an incomplete trailing event is held back.
 - **TUI** is `ratatui` driven from a `tokio::select!` loop over crossterm
   events, log broadcasts, and a 1-second tick.
 
@@ -297,6 +309,8 @@ src/
 ├── backend.rs    # BackendInstance
 ├── manager.rs    # BackendManager
 ├── proxy.rs      # axum routes
+├── stats.rs      # per-request speed stats read off the SSE stream
+├── sysmem.rs     # swap / memory-free snapshot (sysctl)
 └── tui.rs        # TUI state machine + draw
 ```
 
@@ -312,6 +326,16 @@ either kill it or change `listen_port` in `~/.config/loca/proxy.toml`.
 **Long traceback ending in `BrokenPipeError`** in the model log — your client
 disconnected mid-stream and `mlx_lm.server` doesn't handle the broken socket
 gracefully. Cosmetic, can be ignored.
+
+**A model is much slower than expected** — read the Request pane and the
+Memory line:
+- `Memory` red / swap nearly full: the Mac is swapping; close other apps or
+  use a smaller model. This slows every model down several-fold.
+- Long `prompt` phase with few `cached` tokens: the prompt is reprocessed
+  each time (long agent prompts, RAG context).
+- Many `thinking` tokens before the answer: the model is reasoning; disable
+  thinking in the client if you don't need it.
+- `N requests in flight`: requests share the GPU and each one runs slower.
 
 **Gated HuggingFace models** (Llama, Gemma) — run `huggingface-cli login`
 once. The default alias list ships open models only, so this only matters
