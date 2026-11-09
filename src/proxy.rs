@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::manager::BackendManager;
+use crate::assemble::ChatAssembler;
 use crate::stats::SseTap;
 
 #[derive(Clone)]
@@ -226,12 +227,23 @@ async fn forward(
     if let Some(m) = payload.get_mut("model") {
         *m = Value::String(hf.clone());
     }
+    // Non-streaming chat requests are streamed upstream anyway so their
+    // stats are live, then reassembled into one JSON reply (ChatAssembler).
+    // Logprobs aren't carried over by the reassembly, so those stay as-is.
+    let rebuild = !is_stream
+        && path == "/v1/chat/completions"
+        && !payload["logprobs"].as_bool().unwrap_or(false);
+    if rebuild {
+        payload["stream"] = Value::Bool(true);
+    }
     // Ask for the final usage chunk (exact token counts, cached prompt
     // tokens) on every stream; SseTap drops it if the client didn't ask.
+    // A reassembled reply always carries usage, like mlx's own JSON reply.
     let client_wants_usage = payload["stream_options"]["include_usage"]
         .as_bool()
         .unwrap_or(false);
-    if is_stream && !client_wants_usage {
+    let strip_usage = !client_wants_usage && !rebuild;
+    if (is_stream || rebuild) && !client_wants_usage {
         if let Some(obj) = payload.as_object_mut() {
             let opts = obj.entry("stream_options").or_insert_with(|| json!({}));
             if let Some(opts) = opts.as_object_mut() {
@@ -280,9 +292,9 @@ async fn forward(
     let inst_for_stream = inst.clone();
     let mut last_heartbeat = std::time::Instant::now();
     let heartbeat_every = std::time::Duration::from_secs(5);
-    let tap = std::sync::Arc::new(parking_lot::Mutex::new(SseTap::new(!client_wants_usage)));
+    let tap = std::sync::Arc::new(parking_lot::Mutex::new(SseTap::new(strip_usage)));
     let tap_for_end = tap.clone();
-    let tap_events = is_stream && status.is_success();
+    let tap_events = (is_stream || rebuild) && status.is_success();
     let stream = upstream_resp.bytes_stream().map(move |chunk| {
         // Borrow keeps the guard alive for the closure's lifetime.
         let g = &guard;
@@ -324,7 +336,28 @@ async fn forward(
     let tail = futures::stream::once(async move {
         Ok::<_, std::io::Error>(tap_for_end.lock().finish())
     });
-    let body = Body::from_stream(stream.chain(tail));
+    let stream = stream.chain(tail);
+
+    if rebuild && status.is_success() {
+        let mut stream = Box::pin(stream);
+        let mut assembler = ChatAssembler::default();
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(b) => assembler.feed(&b),
+                Err(e) => {
+                    inst.note_error();
+                    return (
+                        StatusCode::BAD_GATEWAY,
+                        Json(json!({"error": {"message": format!("upstream error: {e}")}})),
+                    )
+                        .into_response();
+                }
+            }
+        }
+        return Json(assembler.finish()).into_response();
+    }
+
+    let body = Body::from_stream(stream);
     let mut response = Response::new(body);
     *response.status_mut() = status;
     response

@@ -272,6 +272,11 @@ backend sees the HF id it was spawned with. On streaming requests it also
 sets `stream_options.include_usage` (for exact token counts) and drops the
 resulting usage chunk again if the client didn't ask for it.
 
+Non-streaming `/v1/chat/completions` requests are streamed from the backend
+anyway, so their stats are live too, and reassembled into the usual
+`chat.completion` JSON reply. Requests with `logprobs` are passed through
+unchanged.
+
 ## CLI
 
 | Command | Description |
@@ -302,6 +307,7 @@ Source layout:
 ```
 src/
 ├── main.rs       # clap dispatch
+├── assemble.rs   # rebuilds a non-streaming reply from a stream
 ├── paths.rs      # known filesystem locations
 ├── config.rs     # serde models for the TOML files
 ├── init.rs       # first-run setup
